@@ -135,12 +135,11 @@ def swd_write(is_ap, addr, data, ignore_ack=False):
 	if ack_bits[1]: ack |= 2
 	if ack_bits[2]: ack |= 4
 
+	print(f" write raw ack bits: {ack_bits}")
+
 	# Take SWDIO back
 	hold_dio()
 	write_bit(0) # turnaround bit
-
-	if not ignore_ack and ack != 0b001:
-			raise Exception(f"SWD write ack failed: {ack}")
 
 	# Send 32-bit data LSB first
 	ones = 0
@@ -151,6 +150,9 @@ def swd_write(is_ap, addr, data, ignore_ack=False):
 
 	# Send parity
 	write_bit(1 if (ones % 2 == 1) else 0)
+
+	if not ignore_ack and ack != 0b001:
+			raise Exception(f"SWD write ack failed: {ack}")
 
 def swd_read(is_ap, addr):
 # Reads 32 bits
@@ -204,8 +206,14 @@ def swd_read(is_ap, addr):
 	if ack_bits[2]: ack |= 4
 
 	if ack != 0b001:
+		# Still consume the data phase to keep the protocol in sync
+		for _ in range(32):
+			read_bit()
+		read_bit()  # parity
 		hold_dio()
+		write_bit(0)
 		raise Exception(f"SWD read ack failed: {ack}")
+
 
 	# Read 32-bit data LSB first
 	data = 0
@@ -217,6 +225,11 @@ def swd_read(is_ap, addr):
 
 	# Read parity bit
 	parity = read_bit()
+	expected_parity = ones % 2
+	if parity != expected_parity:
+		hold_dio()
+		write_bit(0)
+		raise Exception(f"SWD read parity error: got {parity}, expected {expected_parity} (data=0x{data:08X})")
 
 	# Take SWDIO back AFTER reading data
 	hold_dio()
@@ -229,13 +242,35 @@ def write_dp(addr, data, ignore_ack=False):
 	swd_write(False, addr, data, ignore_ack)
 
 def write_ap(addr, data):
-	swd_write(True, addr, data)
+	try:
+		swd_write(True, addr, data)
+	except Exception:
+		clear_sticky_errors()
+		time.sleep(0.01)
+		swd_write(True, addr, data)
 
 def read_dp(addr):
 	return swd_read(False, addr)
 
 def read_ap(addr):
-	return swd_read(True, addr)
+	try:
+		return swd_read(True, addr)
+	except Exception:
+		clear_sticky_errors()
+		time.sleep(0.01)
+		return swd_read(True, addr)
+
+def clear_sticky_errors():
+	time.sleep(0.005)
+	ctrl_stat = read_dp(0x4)
+	print(f"CTRL/STAT before clear: 0x{ctrl_stat:08X} "
+	      f"(STICKYERR={bool(ctrl_stat & (1<<5))}, "
+	      f"STICKYORUN={bool(ctrl_stat & (1<<1))}, "
+	      f"WDATAERR={bool(ctrl_stat & (1<<7))})")
+	write_dp(0x0, 0x1E) # ABORT: clears STKERRCLR, WDERRCLR, ORUNERRCLR
+	time.sleep(0.005)
+	ctrl_stat_after = read_dp(0x4)
+	print(f"CTRL/STAT after clear: 0x{ctrl_stat_after:08X}")
 
 def swd_init():
 	# Initializes debug interface on the Pico
@@ -253,9 +288,10 @@ def swd_init():
 
 	# Step 2: Send 128-bit selection alert
 	selection_alert = [
-		0x49, 0xCF, 0x90, 0x46, 0xA9, 0xB4, 0xA1, 0x61,
-		0x97, 0xF5, 0xBB, 0xC7, 0x45, 0x70, 0x3D, 0x98
+		0x92, 0xF3, 0x09, 0x62, 0x95, 0x2D, 0x85, 0x86,
+		0xE9, 0xAF, 0xDD, 0xE3, 0xA2, 0x0E, 0xBC, 0x19
 	]
+
 	for byte in selection_alert:
 		for i in range(8):
 			write_bit((byte >> i) & 1)
@@ -282,22 +318,24 @@ def swd_init():
 	# ignore_ack=True because target doesn't acknowledge this specific step
 	write_dp(0xc, 0x01002927, ignore_ack=True)
 
-	time.sleep(0.001) # 1ms pause
-
-	# Step 7: Read chip ID code, should return 0x0BC12477
-	for _ in range(64):
-		write_bit(1)
-
-	for _ in range(8):
-		write_bit(0)
-	#ack =7 (all 1s) means always reading high
-
-
+	# Immediately read DPIDR to confirm/latch the target selection —
+	# per ADI spec B4.3.4, nothing else (especially not another line
+	# reset) may happen between the TARGETSEL write and this read.
 	idcode = read_dp(0x0)
 
 	print(f"IDCODE: 0x{idcode:08X}")
 	if idcode != 0x0BC12477:
 		raise Exception(f"Unexpected IDCODE: 0x{idcode:08X}")
+
+	# Diagnostic: confirm we actually landed on core0's real DP, not a fallback
+	write_dp(0x8, 0x00000003)   # SELECT: DPBANKSEL = 3, exposes DLPIDR at 0x4
+	dlpidr = read_dp(0x4)
+	print(f"DLPIDR: 0x{dlpidr:08X} (TINSTANCE={dlpidr >> 28:X})")
+	write_dp(0x8, 0x00000000)   # back to bank 0 before continuing normal setup
+
+	# Step 7 no longer exists lol
+
+	# 8-14: Power up and configure debug system
 
 	# 8-14: Power up and configure debug system
 
@@ -328,9 +366,25 @@ def swd_init():
 
 	# Step 14: Configure AP transfer mode
 	# Auto increment on, word transfer
-	write_ap(0x0, (0b01 << 4) | (0b010))
+	write_ap(0x0, CSW_VALUE)
+
+	# Diagnostic if the write actually took effect
+	read_ap(0x0)
+	csw_readback = read_dp(0xC)
+	print(f"CSW readback (wrote 0x{CSW_VALUE:08X}): 0x{csw_readback:08x}")
 
 	print("SWD initialization complete")
+
+
+def swd_connect(max_attempts=5):
+	for attempt in range(1, max_attempts + 1):
+		try:
+			swd_init()
+			return
+		except Exception as e:
+			print(f"Connect attempt {attempt} failed: {e}")
+			time.sleep(0.2)
+	raise Exception("Failed to connect to target after multiple attempts. Try setting pin 30 (RUN) on the Pico to GND for a second.")
 
 
 #Memory read/write
@@ -387,19 +441,44 @@ def resume_cpu():
 
 def reset_into_debug():
 	print("Resetting into debug mode...")
-	# Set vector catch to halt immediately after reset
-	# Sets VC_CORERESET bit in DEMCR
-	write_word(0xE000EDFC, 0x00000001)
-	# Request system reset
-	# Writes SYSRESETREQ bit in AIRCR
-	write_word(0xE000ED0C, 0x05FA0004)
-	time.sleep(0.1)
-	# Verify halted after reset
+
+	write_word(0xE000EDF0, 0xA05F0001)   # DHCSR: C_DEBUGEN = 1
+	write_word(0xE000EDFC, 0x00000001)   # DEMCR: VC_CORERESET
+	write_word(0xE000ED0C, 0x05FA0004)   # AIRCR: SYSRESETREQ
+
+	for _ in range(200):
+		dhcsr = read_word(0xE000EDF0)
+		if not (dhcsr & (1 << 25)):
+			break
+		time.sleep(0.001)
+	else:
+		raise Exception("Timed out waiting for S_RESET_ST to clear")
+
+	# Re-establish the debug port / AP
+	write_dp(0x0, 0x1E)
+	write_dp(0x8, 0x00000000)
+	write_dp(0x4, (1 << 30) | (1 << 28) | (1 << 0))
+	ctrl_stat = read_dp(0x4)
+	if not (ctrl_stat & (1 << 31)) or not (ctrl_stat & (1 << 29)):
+		raise Exception("Debug power up failed after reset")
+	write_dp(0x8, 0x00000000)
+	write_ap(0x0, CSW_VALUE) # reconfigure CSW (auto-inc, word)
+	clear_sticky_errors()
+
+	# Diagnostic: verify basic memory reads work post-reset before
+	# assuming anything about DHCSR specifically
+	reset_vector = read_word(0x00000004)
+	print(f"Reset vector (sanity check, should be nonzero): 0x{reset_vector:08X}")
+
+	# Force a halt outright, in case C_DEBUGEN/VC_CORERESET got wiped by the reset
+	write_word(0xE000EDF0, 0xA05F0003)   # C_DEBUGEN | C_HALT
+	time.sleep(0.01)
+
 	dhcsr = read_word(0xE000EDF0)
+	print(f"DHCSR after reset: 0x{dhcsr:08X}")
 	if not (dhcsr & (1 << 17)):
 		raise Exception("CPU failed to halt after reset")
 	print("CPU reset and halted")
-	# Safer than halting a running CPU mid-execution
 
 # Core register numbers
 REG_R0 = 0
@@ -485,6 +564,7 @@ def call_rom_function(func_addr, r0=0, r1=0, r2=0, r3=0):
 FLASH_START = 0x10000000 # XIP flash start address
 RAM_WORK_AREA = 0x20000100 # where we stage data in RAM
 PAGE_SIZE = 4096 # 4K pages
+CSW_VALUE = (1 << 31) | (0b01 << 4) | 0b010   # DbgSwEnable=1, AddrInc=1, Size=word
 
 # Flash operations:
 
@@ -523,10 +603,10 @@ def flash_program_page(addr, data):
 	offset = 0
 	for i in range(0, len(data), 4):
 	# Pack 4 bytes into a 32-bit word
-		word = (data[i] |
-		(data[i+1] << 8) |
-		(data[i+2] << 16) |
-		(data[i+3] << 24))
+		word = (data[i]
+		| (data[i+1] << 8)
+		| (data[i+2] << 16)
+		| (data[i+3] << 24))
 	write_word(RAM_WORK_AREA + offset, word)
 	offset += 4
 
@@ -549,6 +629,49 @@ def verify_page(addr, data):
 		raise Exception(f"Verify failed at 0x{addr+i:08X}: "
 			f"expected 0x{word:08X} got 0x{flash_word:08X}")
 
+
+def call_rom_function_raw(func_addr, r0=0, r1=0, r2=0, r3=0):
+	"""Call a ROM function directly, without the DT trampoline.
+	Only used to bootstrap table_lookup() before DT's address is known."""
+	BKPT_STUB = 0x20000040
+	write_word(BKPT_STUB, 0xBE00BE00)   # two BKPT #0 instructions, back to back
+
+	write_core_reg(REG_R0, r0)
+	write_core_reg(REG_R1, r1)
+	write_core_reg(REG_R2, r2)
+	write_core_reg(REG_R3, r3)
+	write_core_reg(REG_SP, 0x20000080)
+	write_core_reg(REG_LR, BKPT_STUB | 1)   # on return, land on our BKPT stub
+	write_core_reg(REG_PC, func_addr | 1)   # jump straight into the function
+
+	dfsr = read_word(0xE000ED30)
+	write_word(0xE000ED30, dfsr)
+	write_word(0xE000EDF0, 0xA05F0009)      # resume
+
+	for _ in range(10000):
+		dhcsr = read_word(0xE000EDF0)
+		if dhcsr & (1 << 17):
+			return
+		time.sleep(0.0001)
+	raise Exception("Timeout waiting for ROM function to complete")
+
+
+def lookup_rom_function(code_str):
+	c1 = ord(code_str[0])
+	c2 = ord(code_str[1])
+	code = c1 | (c2 << 8)
+
+	table_ptr = read_half_word(0x00000014)   # pointer to the function table
+	lookup_fn = read_half_word(0x00000018)   # address of table_lookup(), fixed, no lookup needed
+
+	call_rom_function_raw(lookup_fn, r0=table_ptr, r1=code)
+	result = read_core_reg(REG_R0)
+
+	if result == 0:
+		raise Exception(f"ROM function '{code_str}' not found")
+	return result
+
+
 # Main flash function:
 def flash_binary(filename):
 
@@ -569,7 +692,7 @@ def flash_binary(filename):
 	print(f"Flashing {len(binary)} bytes ({total_pages} pages)...")
 
 	# Initialize SWD
-	swd_init()
+	swd_connect()
 
 	# Reset CPU into debug mode
 	reset_into_debug()
@@ -617,6 +740,37 @@ def cleanup():
 
 	# Runs only when script is executed directly, not imported as module
 
+def test_stage_1_reset_only():
+	"""Stage 1: connect + reset + halt only. No flash touched."""
+	swd_connect()
+	reset_into_debug()
+	write_word(0xE000ED08, 0x20000000)  # VTOR -> RAM
+	print("Stage 1 PASSED: connect + reset + halt all worked")
+
+
+def test_stage_2_lookup():
+	"""Stage 2: stage 1, plus resolve a ROM function via table_lookup bootstrap."""
+	swd_connect()
+	reset_into_debug()
+	write_word(0xE000ED08, 0x20000000)
+
+	addr = lookup_rom_function("CX")
+	print(f"CX (flash_enter_cmd_xip) resolved to: 0x{addr:08X}")
+	if addr == 0 or addr > 0x00004000:
+		print("WARNING: address looks implausible for boot ROM (expected < 0x4000)")
+	else:
+		print("Stage 2 PASSED: table_lookup bootstrap works")
+
+
+def test_stage_3_trampoline_call():
+	"""Stage 3: stage 2, plus one real call through the DT trampoline."""
+	swd_connect()
+	reset_into_debug()
+	write_word(0xE000ED08, 0x20000000)
+
+	flash_connect()  # exercises lookup_rom_function("DT") + call_rom_function()
+	print("Stage 3 PASSED: DT trampoline + ROM call worked (connect_internal_flash ran)")
+
 ### ENTRY POINT ###
 if __name__ == "__main__":
 # sys.argv[0] = script name (pico_flash.py)
@@ -641,7 +795,7 @@ if __name__ == "__main__":
 		time.sleep(0.1)
 		print(f"Output LOW: {lgpio.gpio_read(h, SWDIO_PIN)}")
 
-		lgpio.gpio_claim_input(h, SWDIO_PIN, lgpio.SET_PULL_DOWN)
+		lgpio.gpio_claim_input(h, SWDIO_PIN)
 		time.sleep(0.1)
 		print(f"Input with pull-down (nothing connected): {lgpio.gpio_read(h, SWDIO_PIN)}")
 
@@ -650,7 +804,7 @@ if __name__ == "__main__":
 		time.sleep(0.1)
 		print(f"Output HIGH: {lgpio.gpio_read(h, SWDIO_PIN)}")
 
-		lgpio.gpio_claim_input(h, SWDIO_PIN, lgpio.SET_PULL_DOWN)
+		lgpio.gpio_claim_input(h, SWDIO_PIN)
 		time.sleep(0.1)
 		print(f"Input with pull-down after HIGH: {lgpio.gpio_read(h, SWDIO_PIN)}")
 
@@ -662,8 +816,23 @@ if __name__ == "__main__":
 		print("Usage: sudo python3 pico_flash.py firmware.bin")
 		sys.exit(1)
 
+	"""
 	try:
 		flash_binary(sys.argv[1]) # Pass filename argument to main
+	except Exception as e:
+		print(f"Error: {e}")
+	finally:
+		cleanup()
+	"""
+
+	try:
+		# --- TESTING: comment/uncomment one line at a time, in order ---
+		test_stage_1_reset_only()
+		# test_stage_2_lookup()
+		# test_stage_3_trampoline_call()
+
+		# --- Once all three pass, switch back to the real thing: ---
+		# flash_binary(sys.argv[1])
 	except Exception as e:
 		print(f"Error: {e}")
 	finally:
