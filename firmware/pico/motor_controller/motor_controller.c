@@ -16,6 +16,8 @@
 
 #include "pico_uart_transports.h"
 
+#include <rmw_microros/rmw_microros.h>
+
 // Side selection -----------------------------------------------------------------
 // Build-time selectable via CMake: -DMOTOR_SIDE=LEFT or -DMOTOR_SIDE=RIGHT
 // Falls back to LEFT_SIDE if not defined by the build system.
@@ -56,7 +58,8 @@
 #define ACS712_ZERO_VOLTS 	2.5f    // ACS712 output voltage at 0A
 #define ADC_REF_VOLTAGE 	3.3f    // Pico ADC reference voltage
 #define ADC_RESOLUTION 		4095.0f // 12-bit ADC max value
-#define VOLTAGE_DIVIDER 	0.667f  // voltage divider ratio: 20k/(10k+20k)
+#define VOLTAGE_DIVIDER 	0.48f  // voltage divider ratio: 20k/(10k+20k) = 0.667
+					// changed to 0.48 because measured 1.2V at GP26
 #define PWM_MAX_COUNT 		12500   // PWM wrap: 125MHz / 12500 = 10kHz
 #define CMD_TIMEOUT_MS 		500     // watchdog: stop motors after 500ms silence
 
@@ -119,6 +122,10 @@ void set_motor(float speed) {
 	// Clamp speed to valid range -1.0 to +1.0
 	if (speed > 1.0f)  speed = 1.0f;
 	if (speed < -1.0f) speed = -1.0f;
+
+#ifdef RIGHT_SIDE
+	speed = -speed;  // right side motor is mounted mirrored, invert to match left
+#endif
 
 	// Set direction pin based on sign of speed
 	if (speed >= 0) {
@@ -367,8 +374,26 @@ bool microros_setup() {
 	return true;
 }
 
+
+#define CMD_FORWARD  0x01
+#define CMD_BACKWARD 0x02
+#define CMD_STOP     0x03
+
+
 // Main ----------------------------------------------------------------------------------
 int main() {
+
+	/*
+        gpio_init(PICO_DEFAULT_LED_PIN);
+        gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+        for (int i = 0; i < 3; i++) {
+                gpio_put(PICO_DEFAULT_LED_PIN, 1); sleep_ms(100);
+                gpio_put(PICO_DEFAULT_LED_PIN, 0); sleep_ms(100);
+        }
+
+
+	stdio_init_all();
+
 	// NOTE: stdio_init_all() intentionally omitted
 	// It would claim UART0 (GP0/GP1) conflicting with micro-ROS transport
 
@@ -389,13 +414,95 @@ int main() {
 	);
 
 	// Wait for micro-ROS agent to come online
-	// Pico will sit here patiently until Pi 5 agent is running
+	// Pico will sit here until Pi 5 agent is running
 	while (rmw_uros_ping_agent(1000, 5) != RMW_RET_OK) {
 		sleep_ms(100);
 	}
+
+
+	for (int i = 0; i < 6; i++) {
+		gpio_put(PICO_DEFAULT_LED_PIN, 1);
+		sleep_ms(150);
+		gpio_put(PICO_DEFAULT_LED_PIN, 0);
+		sleep_ms(150);
+	}
+
+
 
 	// Enter micro-ROS main loop — never returns
 	microros_setup();
 
 	return 0;
+	*/
+
+
+
+
+        gpio_init(PICO_DEFAULT_LED_PIN);
+        gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+
+        // Boot confirmation: 3 quick blinks = this firmware flashed and is running
+        for (int i = 0; i < 3; i++) {
+                gpio_put(PICO_DEFAULT_LED_PIN, 1); sleep_ms(100);
+                gpio_put(PICO_DEFAULT_LED_PIN, 0); sleep_ms(100);
+        }
+
+        stdio_init_all();
+        sleep_ms(2000);
+        printf("Command-driven motor test starting (control-byte protocol)\n");
+
+        pwm_setup();
+        adc_setup();
+        encoder_setup();
+
+        stop_motor();
+        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+
+        uint32_t last_telemetry_ms = 0;
+        uint32_t last_cmd_ms = to_ms_since_boot(get_absolute_time());
+        const uint32_t CMD_WATCHDOG_MS = 500;  // auto-stop if no command refresh within this window
+
+        while (true) {
+                int c = getchar_timeout_us(0);  // non-blocking check every loop
+
+                if (c == CMD_FORWARD) {
+                        set_motor(0.5f);
+                        gpio_put(PICO_DEFAULT_LED_PIN, 1);
+                        last_cmd_ms = to_ms_since_boot(get_absolute_time());
+                } else if (c == CMD_BACKWARD) {
+                        set_motor(-0.5f);
+                        gpio_put(PICO_DEFAULT_LED_PIN, 1);
+                        last_cmd_ms = to_ms_since_boot(get_absolute_time());
+                } else if (c == CMD_STOP) {
+                        stop_motor();
+                        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+                        last_cmd_ms = to_ms_since_boot(get_absolute_time());
+                }
+
+                // Watchdog: if a move command isn't refreshed regularly, force-stop
+                uint32_t now = to_ms_since_boot(get_absolute_time());
+                if (now - last_cmd_ms > CMD_WATCHDOG_MS) {
+                        stop_motor();
+                        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+                }
+
+                if (now - last_telemetry_ms >= 500) {
+                        last_telemetry_ms = now;
+                        printf("Current: %.2f A | EncFront: %d EncRear: %d\n",
+                                read_current(), encoder_count_front, encoder_count_rear);
+                }
+
+                sleep_ms(10);
+        }
+
+        return 0;
+
+
+	// for a single motor side, run:
+	// sudo minicom -D /dev/ttyAMA2 -b 115200
+
+	// or run for complete directional motor control (both sides):
+	// python3 rover_control.py
+
 }
