@@ -63,6 +63,10 @@
 #define PWM_MAX_COUNT 		12500   // PWM wrap: 125MHz / 12500 = 10kHz
 #define CMD_TIMEOUT_MS 		500     // watchdog: stop motors after 500ms silence
 
+// Mode selection ----------------------------------------------------------------
+//#define USE_MICROROS //Comment out to use byte protocal instead of micro-ros
+//If turned off, use python script
+
 // Encoder state ------------------------------------------------------------------
 // volatile: these are modified in interrupt context, must not be cached
 volatile int32_t encoder_count_front = 0;
@@ -380,124 +384,110 @@ bool microros_setup() {
 #define CMD_STOP     0x03
 
 
-// Main ----------------------------------------------------------------------------------
+// Main ------------------------------------------------------------------------------
 int main() {
+	// Boot confirmation: 3 quick blinks = firmware is running
+    	gpio_init(PICO_DEFAULT_LED_PIN);
+    	gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    	gpio_put(PICO_DEFAULT_LED_PIN, 0);
+    	for (int i = 0; i < 3; i++) {
+		gpio_put(PICO_DEFAULT_LED_PIN, 1); sleep_ms(100);
+        	gpio_put(PICO_DEFAULT_LED_PIN, 0); sleep_ms(100);
+    	}
 
-	/*
-        gpio_init(PICO_DEFAULT_LED_PIN);
-        gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-        for (int i = 0; i < 3; i++) {
-                gpio_put(PICO_DEFAULT_LED_PIN, 1); sleep_ms(100);
-                gpio_put(PICO_DEFAULT_LED_PIN, 0); sleep_ms(100);
-        }
+    	// Initialize hardware peripherals (shared by both modes)
+    	pwm_setup();
+    	adc_setup();
+    	encoder_setup();
+    	stop_motor();
 
+#ifdef USE_MICROROS
+    	// micro-ROS mode -------------------------------------------------------
+    	// NOTE: stdio_init_all() intentionally omitted
+    	// It would claim UART0 (GP0/GP1) conflicting with micro-ROS transport
 
-	stdio_init_all();
+    	// Configure micro-ROS to use Pico UART transport (GP0/GP1)
+    	rmw_uros_set_custom_transport(
+        	true,
+        	NULL,
+        	pico_serial_transport_open,
+        	pico_serial_transport_close,
+        	pico_serial_transport_write,
+        	pico_serial_transport_read
+    	);
 
-	// NOTE: stdio_init_all() intentionally omitted
-	// It would claim UART0 (GP0/GP1) conflicting with micro-ROS transport
+    	// Wait for micro-ROS agent to come online
+    	// Pico will sit here patiently until Pi 5 agent is running
+    	while (rmw_uros_ping_agent(1000, 5) != RMW_RET_OK) {
+        	sleep_ms(100);
+    	}
 
-	// Initialize hardware peripherals
-	pwm_setup();
-	adc_setup();
-	encoder_setup();
+    	// 6 blinks = micro-ROS agent connected and ready
+    	for (int i = 0; i < 6; i++) {
+        	gpio_put(PICO_DEFAULT_LED_PIN, 1); sleep_ms(150);
+        	gpio_put(PICO_DEFAULT_LED_PIN, 0); sleep_ms(150);
+    	}
 
-	// Configure micro-ROS to use Pico UART transport (GP0/GP1)
-	// This is how the Pico communicates with the micro-ROS agent on Pi 5
-	rmw_uros_set_custom_transport(
-		true,
-		NULL,
-		pico_serial_transport_open,
-		pico_serial_transport_close,
-		pico_serial_transport_write,
-		pico_serial_transport_read
-	);
+    	// Enter micro-ROS main loop — never returns
+    	microros_setup();
 
-	// Wait for micro-ROS agent to come online
-	// Pico will sit here until Pi 5 agent is running
-	while (rmw_uros_ping_agent(1000, 5) != RMW_RET_OK) {
-		sleep_ms(100);
-	}
+#else
+	// Simple byte protocol mode --------------------------------------------
+	// Control via UART bytes: 0x01=forward, 0x02=backward, 0x03=stop
+	// Monitor with: sudo minicom -D /dev/ttyAMA2 -b 115200
+	// Or control with: python3 rover_control.py
 
+    	// for a single motor side, run:
+    	// sudo minicom -D /dev/ttyAMA2 -b 115200
 
-	for (int i = 0; i < 6; i++) {
-		gpio_put(PICO_DEFAULT_LED_PIN, 1);
-		sleep_ms(150);
-		gpio_put(PICO_DEFAULT_LED_PIN, 0);
-		sleep_ms(150);
-	}
+    	// or run for complete directional motor control (both sides):
+    	// python3 rover_control.py
 
+    	stdio_init_all();
+    	sleep_ms(500);
+    	printf("Simple byte protocol mode starting\n");
 
+    	gpio_put(PICO_DEFAULT_LED_PIN, 0);
 
-	// Enter micro-ROS main loop — never returns
-	microros_setup();
+    	uint32_t last_telemetry_ms = 0;
+    	uint32_t last_cmd_ms = to_ms_since_boot(get_absolute_time());
 
-	return 0;
-	*/
+    	while (true) {
+        	int c = getchar_timeout_us(0);  // non-blocking check every loop
 
+        	if (c == CMD_FORWARD) {
+            		set_motor(0.5f);
+            		gpio_put(PICO_DEFAULT_LED_PIN, 1);
+            		last_cmd_ms = to_ms_since_boot(get_absolute_time());
+        	} else if (c == CMD_BACKWARD) {
+            		set_motor(-0.5f);
+            		gpio_put(PICO_DEFAULT_LED_PIN, 1);
+            		last_cmd_ms = to_ms_since_boot(get_absolute_time());
+        	} else if (c == CMD_STOP) {
+            		stop_motor();
+            		gpio_put(PICO_DEFAULT_LED_PIN, 0);
+            		last_cmd_ms = to_ms_since_boot(get_absolute_time());
+        	}
 
+        	// Watchdog: auto-stop if no command refresh within window
+        	uint32_t now = to_ms_since_boot(get_absolute_time());
+        	if (now - last_cmd_ms > CMD_TIMEOUT_MS) {
+            		stop_motor();
+            		gpio_put(PICO_DEFAULT_LED_PIN, 0);
+        	}
 
+        	// Telemetry every 500ms
+        	if (now - last_telemetry_ms >= 500) {
+            		last_telemetry_ms = now;
+            		printf("Current: %.2f A | EncFront: %d EncRear: %d\n",
+                	read_current(), encoder_count_front, encoder_count_rear);
+        	}
 
-        gpio_init(PICO_DEFAULT_LED_PIN);
-        gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+        	sleep_ms(10);
+    	}
+#endif
 
-        // Boot confirmation: 3 quick blinks = this firmware flashed and is running
-        for (int i = 0; i < 3; i++) {
-                gpio_put(PICO_DEFAULT_LED_PIN, 1); sleep_ms(100);
-                gpio_put(PICO_DEFAULT_LED_PIN, 0); sleep_ms(100);
-        }
-
-        stdio_init_all();
-        sleep_ms(2000);
-        printf("Command-driven motor test starting (control-byte protocol)\n");
-
-        pwm_setup();
-        adc_setup();
-        encoder_setup();
-
-        stop_motor();
-        gpio_put(PICO_DEFAULT_LED_PIN, 0);
-
-        uint32_t last_telemetry_ms = 0;
-        uint32_t last_cmd_ms = to_ms_since_boot(get_absolute_time());
-        const uint32_t CMD_WATCHDOG_MS = 500;  // auto-stop if no command refresh within this window
-
-        while (true) {
-                int c = getchar_timeout_us(0);  // non-blocking check every loop
-
-                if (c == CMD_FORWARD) {
-                        set_motor(0.5f);
-                        gpio_put(PICO_DEFAULT_LED_PIN, 1);
-                        last_cmd_ms = to_ms_since_boot(get_absolute_time());
-                } else if (c == CMD_BACKWARD) {
-                        set_motor(-0.5f);
-                        gpio_put(PICO_DEFAULT_LED_PIN, 1);
-                        last_cmd_ms = to_ms_since_boot(get_absolute_time());
-                } else if (c == CMD_STOP) {
-                        stop_motor();
-                        gpio_put(PICO_DEFAULT_LED_PIN, 0);
-                        last_cmd_ms = to_ms_since_boot(get_absolute_time());
-                }
-
-                // Watchdog: if a move command isn't refreshed regularly, force-stop
-                uint32_t now = to_ms_since_boot(get_absolute_time());
-                if (now - last_cmd_ms > CMD_WATCHDOG_MS) {
-                        stop_motor();
-                        gpio_put(PICO_DEFAULT_LED_PIN, 0);
-                }
-
-                if (now - last_telemetry_ms >= 500) {
-                        last_telemetry_ms = now;
-                        printf("Current: %.2f A | EncFront: %d EncRear: %d\n",
-                                read_current(), encoder_count_front, encoder_count_rear);
-                }
-
-                sleep_ms(10);
-        }
-
-        return 0;
-
+    	return 0;
 
 	// for a single motor side, run:
 	// sudo minicom -D /dev/ttyAMA2 -b 115200
